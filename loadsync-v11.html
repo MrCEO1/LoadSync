@@ -698,6 +698,7 @@ function startZXing() {
   ];
   hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, formats);
   hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+  hints.set(ZXing.DecodeHintType.PURE_BARCODE, false);
 
   zxingReader=new ZXing.MultiFormatReader();
   zxingReader.setHints(hints);
@@ -705,6 +706,7 @@ function startZXing() {
   const canvas=document.createElement('canvas');
   const ctx=canvas.getContext('2d',{willReadFrequently:true});
   let lastAttempt=0;
+  let attemptCount=0;
 
   function tick() {
     if(!S.scanning) return;
@@ -712,22 +714,41 @@ function startZXing() {
     if(vid.readyState<2) return;
 
     const now=Date.now();
-    if(now-lastAttempt<150) return; // ~6fps decode attempts — fast enough, not draining
+    if(now-lastAttempt<80) return; // ~12fps — faster attempts for tough barcodes
     lastAttempt=now;
+    attemptCount++;
 
-    canvas.width=vid.videoWidth;
-    canvas.height=vid.videoHeight;
+    canvas.width=vid.videoWidth||640;
+    canvas.height=vid.videoHeight||480;
+
+    // Every 3rd frame apply contrast boost to help with orange/dirty barcodes
+    if(attemptCount%3===0) {
+      ctx.filter='contrast(1.8) brightness(1.1) grayscale(1)';
+    } else {
+      ctx.filter='none';
+    }
     ctx.drawImage(vid,0,0);
 
-    try {
-      const imgData=ctx.getImageData(0,0,canvas.width,canvas.height);
-      const luminance=new ZXing.RGBLuminanceSource(imgData.data,canvas.width,canvas.height);
-      const binary=new ZXing.HybridBinarizer(luminance);
-      const bitmap=new ZXing.BinaryBitmap(binary);
-      const result=zxingReader.decode(bitmap);
-      if(result) onScanResult(result.getText().trim().toUpperCase());
-    } catch(e) {
-      // NotFoundException is normal when no barcode in frame — ignore silently
+    // Try full frame first, then center crop for better focus
+    const attempts=[
+      // Full frame
+      {x:0,y:0,w:canvas.width,h:canvas.height},
+      // Center 60% crop — where the reticle box is
+      {x:Math.floor(canvas.width*0.1),y:Math.floor(canvas.height*0.3),
+       w:Math.floor(canvas.width*0.8),h:Math.floor(canvas.height*0.4)},
+    ];
+
+    for(const crop of attempts) {
+      try {
+        const imgData=ctx.getImageData(crop.x,crop.y,crop.w,crop.h);
+        const luminance=new ZXing.RGBLuminanceSource(imgData.data,crop.w,crop.h);
+        const binary=new ZXing.HybridBinarizer(luminance);
+        const bitmap=new ZXing.BinaryBitmap(binary);
+        const result=zxingReader.decode(bitmap);
+        if(result){onScanResult(result.getText().trim().toUpperCase());return;}
+      } catch(e){
+        // NotFoundException — try next crop
+      }
     }
   }
   tick();
@@ -763,26 +784,41 @@ async function captureAndDecode() {
   if(!vid||vid.readyState<2) return;
   document.getElementById('scanStatus').textContent='Analyzing...';
   const canvas=document.createElement('canvas');
-  canvas.width=vid.videoWidth; canvas.height=vid.videoHeight;
+  canvas.width=vid.videoWidth||640; canvas.height=vid.videoHeight||480;
   const ctx=canvas.getContext('2d');
-  ctx.drawImage(vid,0,0);
 
-  // Try ZXing first
   if(typeof ZXing !== 'undefined') {
-    try {
-      const imgData=ctx.getImageData(0,0,canvas.width,canvas.height);
-      const luminance=new ZXing.RGBLuminanceSource(imgData.data,canvas.width,canvas.height);
-      const binary=new ZXing.HybridBinarizer(luminance);
-      const bitmap=new ZXing.BinaryBitmap(binary);
-      const hints=new Map();
-      hints.set(ZXing.DecodeHintType.TRY_HARDER,true);
-      const reader=new ZXing.MultiFormatReader();
-      reader.setHints(hints);
-      const result=reader.decode(bitmap);
-      if(result){onScanResult(result.getText().trim().toUpperCase());return;}
-    } catch(e){}
+    const hints=new Map();
+    hints.set(ZXing.DecodeHintType.TRY_HARDER,true);
+    const reader=new ZXing.MultiFormatReader();
+    reader.setHints(hints);
+
+    // Try 4 passes: normal, contrast boost, center crop, contrast+crop
+    const passes=[
+      ()=>{ctx.filter='none';ctx.drawImage(vid,0,0);return ctx.getImageData(0,0,canvas.width,canvas.height);},
+      ()=>{ctx.filter='contrast(2) grayscale(1)';ctx.drawImage(vid,0,0);return ctx.getImageData(0,0,canvas.width,canvas.height);},
+      ()=>{ctx.filter='none';ctx.drawImage(vid,0,0);
+           const cx=Math.floor(canvas.width*0.1),cy=Math.floor(canvas.height*0.25),
+                 cw=Math.floor(canvas.width*0.8),ch=Math.floor(canvas.height*0.5);
+           return ctx.getImageData(cx,cy,cw,ch);},
+      ()=>{ctx.filter='contrast(2) brightness(1.2) grayscale(1)';ctx.drawImage(vid,0,0);
+           const cx=Math.floor(canvas.width*0.1),cy=Math.floor(canvas.height*0.25),
+                 cw=Math.floor(canvas.width*0.8),ch=Math.floor(canvas.height*0.5);
+           return ctx.getImageData(cx,cy,cw,ch);},
+    ];
+
+    for(const pass of passes) {
+      try {
+        const imgData=pass();
+        const luminance=new ZXing.RGBLuminanceSource(imgData.data,imgData.width,imgData.height);
+        const binary=new ZXing.HybridBinarizer(luminance);
+        const bitmap=new ZXing.BinaryBitmap(binary);
+        const result=reader.decode(bitmap);
+        if(result){onScanResult(result.getText().trim().toUpperCase());return;}
+      } catch(e){}
+    }
   }
-  document.getElementById('scanStatus').textContent='No barcode found — try again';
+  document.getElementById('scanStatus').textContent='No barcode found — move closer and try again';
 }
 
 function onScanResult(val) {
